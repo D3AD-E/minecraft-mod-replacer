@@ -1,9 +1,8 @@
+use dialoguer::{Input, Select};
+use rfd::FileDialog;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-
-use dialoguer::{Input, Select};
-use rfd::FileDialog;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Select the replacement file...");
@@ -15,13 +14,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validate extension
     if replacement_path.extension().and_then(|s| s.to_str()) != Some("jar") {
-        eprintln!("❌ The selected file is not a .jar file.");
+        eprintln!("The selected file is not a .jar file.");
         return Ok(());
     }
 
     let mut replacement_data = Vec::new();
     File::open(&replacement_path)?.read_to_end(&mut replacement_data)?;
     let replacement_size = replacement_data.len() as u64;
+
     println!(
         "Selected replacement file: {}\nSize: {} bytes\n",
         replacement_path.display(),
@@ -33,7 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .interact_text()?;
 
     let mods_path = Path::new(&mods_path_str);
-
     if !mods_path.exists() || !mods_path.is_dir() {
         eprintln!("The specified path is not a valid folder: {:?}", mods_path);
         return Ok(());
@@ -63,7 +62,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Select a mod file to replace:");
-
     let options: Vec<String> = entries
         .iter()
         .map(|(p, size)| {
@@ -89,11 +87,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let padding_needed = original_size - replacement_size;
-    replacement_data.extend(std::iter::repeat(0).take(padding_needed as usize));
 
-    let mut file = File::create(target_path)?;
-    file.write_all(&replacement_data)?;
-    file.flush()?;
+    if padding_needed > 0 {
+        println!("Attempting to pad {} bytes...", padding_needed);
+
+        if let Some(padded_data) = pad_zip_file(replacement_data.clone(), padding_needed as usize)?
+        {
+            let mut file = File::create(target_path)?;
+            file.write_all(&padded_data)?;
+            file.flush()?;
+        } else {
+            // Fallback: simple append with warning
+            eprintln!("⚠️  Warning: Could not pad using ZIP comment. Using simple append method.");
+            eprintln!(
+                "This may cause issues with strict ZIP parsers, but often works in practice."
+            );
+
+            let mut padded_data = replacement_data;
+            let padding = vec![0u8; padding_needed as usize];
+            padded_data.extend(padding);
+
+            let mut file = File::create(target_path)?;
+            file.write_all(&padded_data)?;
+            file.flush()?;
+        }
+    } else {
+        // No padding needed, write directly
+        let mut file = File::create(target_path)?;
+        file.write_all(&replacement_data)?;
+        file.flush()?;
+    }
 
     println!(
         "Replaced '{}' with '{}'. Padded from {} → {} bytes.",
@@ -104,4 +127,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+fn pad_zip_file(
+    mut data: Vec<u8>,
+    padding_size: usize,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    // Maximum comment size in ZIP format is 65535 bytes
+    if padding_size > 65535 {
+        eprintln!("Cannot pad more than 65535 bytes using ZIP comment field");
+        return Ok(None);
+    }
+
+    // Try multiple methods to find the EOCD
+    if let Some(eocd_start) = find_eocd(&data) {
+        let current_comment_len =
+            u16::from_le_bytes([data[eocd_start + 20], data[eocd_start + 21]]) as usize;
+
+        let new_comment_len = current_comment_len + padding_size;
+
+        if new_comment_len > 65535 {
+            eprintln!("Total comment length would exceed ZIP limit of 65535 bytes");
+            return Ok(None);
+        }
+        let new_comment_len_bytes = (new_comment_len as u16).to_le_bytes();
+        data[eocd_start + 20] = new_comment_len_bytes[0];
+        data[eocd_start + 21] = new_comment_len_bytes[1];
+        let padding = vec![b'#'; padding_size];
+        data.extend(padding);
+
+        Ok(Some(data))
+    } else {
+        Ok(None)
+    }
+}
+
+fn find_eocd(data: &[u8]) -> Option<usize> {
+    let eocd_signature = [0x50, 0x4b, 0x05, 0x06];
+
+    let search_start = data.len().saturating_sub(65557);
+    for i in (search_start..data.len().saturating_sub(3)).rev() {
+        if i + 22 <= data.len() && data[i..i + 4] == eocd_signature {
+            let comment_len = u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
+            if i + 22 + comment_len <= data.len() {
+                return Some(i);
+            }
+        }
+    }
+    println!("Standard EOCD search failed, trying thorough search...");
+    for i in (0..data.len().saturating_sub(21)).rev() {
+        if data[i..i + 4] == eocd_signature {
+            if i + 22 <= data.len() {
+                let comment_len = u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
+                if i + 22 + comment_len <= data.len() {
+                    println!("Found EOCD at position {}", i);
+                    return Some(i);
+                }
+            }
+        }
+    }
+
+    println!(
+        "Could not find valid EOCD record in file of {} bytes",
+        data.len()
+    );
+    None
 }

@@ -39,7 +39,7 @@ Maintains file size through two methods:
 [package]
 name = "minecraft_mod_replacer"
 version = "0.1.0"
-edition = "2024"
+edition = "2025"
 
 [dependencies]
 dialoguer = "0.11.0"

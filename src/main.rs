@@ -1,11 +1,34 @@
-use dialoguer::{Input, Select};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use dialoguer::{Input, Select};
+use rfd::FileDialog;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Ask the user for the mods folder path
-    let mods_path_str: String = Input::new()
+    println!("Select the replacement file...");
+    let replacement_path = FileDialog::new()
+        .set_title("Select Replacement .jar File")
+        .add_filter("Jar Files", &["jar"])
+        .pick_file()
+        .ok_or("No file selected")?;
+
+    // Validate extension
+    if replacement_path.extension().and_then(|s| s.to_str()) != Some("jar") {
+        eprintln!("❌ The selected file is not a .jar file.");
+        return Ok(());
+    }
+
+    let mut replacement_data = Vec::new();
+    File::open(&replacement_path)?.read_to_end(&mut replacement_data)?;
+    let replacement_size = replacement_data.len() as u64;
+    println!(
+        "Selected replacement file: {}\nSize: {} bytes\n",
+        replacement_path.display(),
+        replacement_size
+    );
+
+    let mods_path_str: String = Input::<String>::new()
         .with_prompt("Enter the full path to your Minecraft 'mods' folder")
         .interact_text()?;
 
@@ -16,50 +39,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // List .jar files in the folder
-    let entries: Vec<PathBuf> = fs::read_dir(&mods_path)?
+    let mut entries: Vec<(PathBuf, u64)> = fs::read_dir(&mods_path)?
         .filter_map(|entry| {
             let path = entry.ok()?.path();
             if path.extension().map_or(false, |ext| ext == "jar") {
-                Some(path)
+                let size = fs::metadata(&path).ok()?.len();
+                if replacement_size <= size {
+                    Some((path, size))
+                } else {
+                    None
+                }
             } else {
                 None
             }
         })
         .collect();
 
+    entries.sort_by_key(|(_, size)| ((*size as i64 - replacement_size as i64).abs()));
+
     if entries.is_empty() {
-        println!("No .jar mod files found in {:?}", mods_path);
+        println!("No suitable .jar mod files found in {:?}", mods_path);
         return Ok(());
     }
 
     println!("Select a mod file to replace:");
+
     let options: Vec<String> = entries
         .iter()
-        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .map(|(p, size)| {
+            let diff = (*size as i64 - replacement_size as i64).abs();
+            format!(
+                "{} | {} bytes | Δ {} bytes",
+                p.file_name().unwrap().to_string_lossy(),
+                size,
+                diff
+            )
+        })
         .collect();
 
     let selection = Select::new().items(&options).default(0).interact()?;
-    let target_file = &entries[selection];
-    let original_size = fs::metadata(target_file)?.len();
+    let (target_path, original_size) = &entries[selection];
 
-    let replacement_path: PathBuf = Input::<String>::new()
-        .with_prompt("Enter path to replacement file")
-        .interact_text()?
-        .into();
-
-    if !replacement_path.exists() {
-        eprintln!("Replacement file does not exist.");
-        return Ok(());
-    }
-
-    let mut replacement_data = Vec::new();
-    File::open(&replacement_path)?.read_to_end(&mut replacement_data)?;
-    let replacement_size = replacement_data.len() as u64;
-
-    if replacement_size > original_size {
+    if replacement_size > *original_size {
         eprintln!(
-            "Replacement file is larger ({} bytes) than original ({} bytes). Aborting.",
+            "Replacement file is larger ({} bytes) than selected mod ({} bytes). Aborting.",
             replacement_size, original_size
         );
         return Ok(());
@@ -68,13 +91,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let padding_needed = original_size - replacement_size;
     replacement_data.extend(std::iter::repeat(0).take(padding_needed as usize));
 
-    let mut file = File::create(target_file)?;
+    let mut file = File::create(target_path)?;
     file.write_all(&replacement_data)?;
     file.flush()?;
 
     println!(
-        "Replaced '{}' with '{}'. Size: {} → {} (padded).",
-        options[selection],
+        "Replaced '{}' with '{}'. Padded from {} → {} bytes.",
+        target_path.file_name().unwrap().to_string_lossy(),
         replacement_path.display(),
         replacement_size,
         original_size
